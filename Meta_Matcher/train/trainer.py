@@ -16,6 +16,13 @@ from .plots import plot_history
 from ..io.checkpoints import save_best_checkpoint
 
 
+def resolve_runtime_device(cfg: MetaMatcherConfig) -> str:
+    if str(cfg.device).startswith("cuda") and not torch.cuda.is_available():
+        print(f"[WARN] cfg.device='{cfg.device}' but CUDA is unavailable. Falling back to CPU.")
+        return "cpu"
+    return cfg.device
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -51,13 +58,15 @@ class FocalBCEWithLogitsLoss(nn.Module):
         return loss.mean()
 
 
-def make_loss(cfg: MetaMatcherConfig, train_loader: Optional[DataLoader] = None):
+def make_loss(cfg: MetaMatcherConfig, train_loader: Optional[DataLoader] = None, device: Optional[str] = None):
+    runtime_device = device if device is not None else cfg.device
+
     if cfg.loss_type == "ce" or (cfg.loss_type == "auto" and cfg.output == "softmax"):
         return nn.CrossEntropyLoss()
 
     pos_weight = None
     if cfg.use_pos_weight and train_loader is not None:
-        pos_weight = infer_pos_weight(train_loader, cfg.device)
+        pos_weight = infer_pos_weight(train_loader, runtime_device)
 
     if cfg.loss_type == "focal_bce":
         return FocalBCEWithLogitsLoss(gamma=cfg.focal_gamma, pos_weight=pos_weight)
@@ -66,9 +75,15 @@ def make_loss(cfg: MetaMatcherConfig, train_loader: Optional[DataLoader] = None)
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, cfg: MetaMatcherConfig) -> Dict[str, Any]:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    cfg: MetaMatcherConfig,
+    device: str,
+    loss_fn: Optional[nn.Module] = None,
+) -> Dict[str, Any]:
     model.eval()
-    loss_fn = make_loss(cfg)
+    local_loss_fn = loss_fn if loss_fn is not None else make_loss(cfg, device=device)
 
     all_pos_probs = []
     all_true = []
@@ -77,13 +92,13 @@ def evaluate(model: nn.Module, loader: DataLoader, cfg: MetaMatcherConfig) -> Di
     alphas = []
 
     for scores, emb, labels in loader:
-        scores = scores.to(cfg.device)
-        emb = emb.to(cfg.device)
+        scores = scores.to(device)
+        emb = emb.to(device)
 
         if cfg.output == "sigmoid":
-            y = labels.float().to(cfg.device).view(-1, 1)
+            y = labels.float().to(device).view(-1, 1)
         else:
-            y = labels.long().to(cfg.device)
+            y = labels.long().to(device)
 
         out = model(scores, emb)
         logits = out["logits"]
@@ -91,7 +106,7 @@ def evaluate(model: nn.Module, loader: DataLoader, cfg: MetaMatcherConfig) -> Di
         if isinstance(out, dict) and out.get("alpha", None) is not None:
             alphas.append(out["alpha"].detach().cpu().numpy())
 
-        loss = loss_fn(logits, y)
+        loss = local_loss_fn(logits, y)
 
         bs = scores.size(0)
         total_loss += float(loss.item()) * bs
@@ -163,8 +178,10 @@ def train(
     os.makedirs(out_dir, exist_ok=True)
     set_seed(cfg.seed)
 
-    model = MetaMatcher(cfg).to(cfg.device)
-    loss_fn = make_loss(cfg, train_loader=train_loader)
+    runtime_device = resolve_runtime_device(cfg)
+
+    model = MetaMatcher(cfg).to(runtime_device)
+    loss_fn = make_loss(cfg, train_loader=train_loader, device=runtime_device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     scheduler = None
@@ -184,6 +201,7 @@ def train(
         "val_alpha_mean": [], "test_alpha_mean": [],
         "val_alpha_std": [], "test_alpha_std": [],
         "lr": [], "entropy_weight": [],
+        "device": runtime_device,
     }
 
     best = {"score": float("-inf"), "epoch": -1, "path": None, "metrics": None}
@@ -196,9 +214,9 @@ def train(
         ent_weight = entropy_weight_for_epoch(cfg, epoch)
 
         for scores, emb, labels in train_loader:
-            scores = scores.to(cfg.device)
-            emb = emb.to(cfg.device)
-            y = labels.float().to(cfg.device).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(cfg.device)
+            scores = scores.to(runtime_device)
+            emb = emb.to(runtime_device)
+            y = labels.float().to(runtime_device).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(runtime_device)
 
             opt.zero_grad(set_to_none=True)
 
@@ -224,8 +242,12 @@ def train(
 
         train_loss = running / max(1, n)
 
-        val_metrics = evaluate(model, val_loader, cfg)
-        test_metrics = evaluate(model, test_loader, cfg) if test_loader is not None else None
+        val_metrics = evaluate(model, val_loader, cfg, device=runtime_device, loss_fn=loss_fn)
+        test_metrics = (
+            evaluate(model, test_loader, cfg, device=runtime_device, loss_fn=loss_fn)
+            if test_loader is not None
+            else None
+        )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
@@ -268,7 +290,7 @@ def train(
             f"[Epoch {epoch:03d}/{cfg.epochs}] train_loss={train_loss:.4f} "
             f"val_loss={val_metrics['loss']:.4f} val_f1={val_metrics.get('f1', float('nan')):.4f} "
             f"val_auc={val_metrics.get('auc', float('nan')):.4f} "
-            f"lr={opt.param_groups[0]['lr']:.3e} ent_w={ent_weight:.4f}"
+            f"lr={opt.param_groups[0]['lr']:.3e} ent_w={ent_weight:.4f} device={runtime_device}"
         )
 
         if cfg.early_stopping_patience > 0 and epochs_without_improvement >= cfg.early_stopping_patience:
@@ -280,6 +302,7 @@ def train(
         "git_commit": get_git_commit(),
         "config": cfg.__dict__,
         "best_epoch": best["epoch"],
+        "runtime_device": runtime_device,
     }
 
     with open(os.path.join(out_dir, "history.json"), "w", encoding="utf-8") as f:
