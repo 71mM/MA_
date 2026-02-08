@@ -1,5 +1,9 @@
-import os, json
-from typing import Optional, Dict, Any
+import os
+import json
+import random
+import subprocess
+from typing import Optional, Dict, Any, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,98 +16,200 @@ from .plots import plot_history
 from ..io.checkpoints import save_best_checkpoint
 
 
-def make_loss(cfg: MetaMatcherConfig):
-    return nn.BCEWithLogitsLoss() if cfg.output == "sigmoid" else nn.CrossEntropyLoss()
+def resolve_runtime_device(cfg: MetaMatcherConfig) -> str:
+    if str(cfg.device).startswith("cuda") and not torch.cuda.is_available():
+        print(f"[WARN] cfg.device='{cfg.device}' but CUDA is unavailable. Falling back to CPU.")
+        return "cpu"
+    return cfg.device
 
 
-@torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, cfg: MetaMatcherConfig) -> Dict[str, Any]:
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def infer_pos_weight(train_loader: DataLoader, device: str) -> Optional[torch.Tensor]:
+    pos = 0
+    neg = 0
+    for _, _, labels in train_loader:
+        labels_np = labels.cpu().numpy().astype(np.int32)
+        pos += int((labels_np == 1).sum())
+        neg += int((labels_np == 0).sum())
+    if pos == 0:
+        return None
+    return torch.tensor([neg / max(pos, 1)], dtype=torch.float32, device=device)
+
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.gamma = gamma
+        self.bce = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = self.bce(logits, targets)
+        pt = torch.exp(-bce)
+        loss = ((1 - pt) ** self.gamma) * bce
+        return loss.mean()
+
+
+def make_loss(cfg: MetaMatcherConfig, train_loader: Optional[DataLoader] = None, device: Optional[str] = None):
+    runtime_device = device if device is not None else cfg.device
+
+    if cfg.loss_type == "ce" or (cfg.loss_type == "auto" and cfg.output == "softmax"):
+        return nn.CrossEntropyLoss()
+
+    pos_weight = None
+    if cfg.use_pos_weight and train_loader is not None:
+        pos_weight = infer_pos_weight(train_loader, runtime_device)
+
+    if cfg.loss_type == "focal_bce":
+        return FocalBCEWithLogitsLoss(gamma=cfg.focal_gamma, pos_weight=pos_weight)
+
+    return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+
+def _prepare_targets(labels: torch.Tensor, cfg: MetaMatcherConfig, device: str) -> Tuple[torch.Tensor, np.ndarray]:
+    labels_cpu = labels.cpu().numpy().astype(np.int32)
+    if cfg.output == "sigmoid":
+        y = labels.float().to(device, non_blocking=True).view(-1, 1)
+    else:
+        y = labels.long().to(device, non_blocking=True)
+    return y, labels_cpu
+
+
+def _extract_pos_prob(logits: torch.Tensor, cfg: MetaMatcherConfig) -> Optional[np.ndarray]:
+    if cfg.output == "sigmoid":
+        return torch.sigmoid(logits).squeeze(-1).detach().cpu().numpy()
+
+    if cfg.output == "softmax" and cfg.n_classes == 2:
+        probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+        return probs[:, 1]
+
+    return None
+
+
+class AlphaStats:
+    def __init__(self):
+        self.count = 0
+        self.sum_vec = None
+        self.sum_sq_vec = None
+        self.entropy_sum = 0.0
+
+    def update(self, alpha: torch.Tensor) -> None:
+        a = alpha.detach().cpu().numpy()
+        if a.size == 0:
+            return
+
+        if self.sum_vec is None:
+            self.sum_vec = np.zeros(a.shape[1], dtype=np.float64)
+            self.sum_sq_vec = np.zeros(a.shape[1], dtype=np.float64)
+
+        self.sum_vec += a.sum(axis=0)
+        self.sum_sq_vec += (a ** 2).sum(axis=0)
+        self.count += a.shape[0]
+
+        eps = 1e-12
+        self.entropy_sum += float((-a * np.log(a + eps)).sum(axis=1).sum())
+
+    def finalize(self) -> Dict[str, Any]:
+        if self.count == 0 or self.sum_vec is None or self.sum_sq_vec is None:
+            return {}
+
+        mean = self.sum_vec / self.count
+        var = np.maximum(self.sum_sq_vec / self.count - mean ** 2, 0.0)
+        std = np.sqrt(var)
+
+        return {
+            "alpha_mean": mean.tolist(),
+            "alpha_std": std.tolist(),
+            "alpha_entropy": self.entropy_sum / self.count,
+        }
+
+
+@torch.inference_mode()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    cfg: MetaMatcherConfig,
+    device: str,
+    loss_fn: Optional[nn.Module] = None,
+) -> Dict[str, Any]:
     model.eval()
-    loss_fn = make_loss(cfg)
+    local_loss_fn = loss_fn if loss_fn is not None else make_loss(cfg, device=device)
+    is_binary_eval = cfg.output == "sigmoid" or (cfg.output == "softmax" and cfg.n_classes == 2)
 
     all_pos_probs = []
     all_true = []
     total_loss = 0.0
     n = 0
-
-    # collect gating weights if present
-    alphas = []
+    alpha_stats = AlphaStats()
 
     for scores, emb, labels in loader:
-        scores = scores.to(cfg.device)
-        emb = emb.to(cfg.device)
-
-        if cfg.output == "sigmoid":
-            y = labels.float().to(cfg.device).view(-1, 1)
-        else:
-            y = labels.long().to(cfg.device)
+        scores = scores.to(device, non_blocking=True)
+        emb = emb.to(device, non_blocking=True)
+        y, y_true_np = _prepare_targets(labels, cfg, device)
 
         out = model(scores, emb)
         logits = out["logits"]
 
-        # alpha capture
-        if isinstance(out, dict) and out.get("alpha", None) is not None:
-            alphas.append(out["alpha"].detach().cpu().numpy())
-
-        loss = loss_fn(logits, y)
+        loss = local_loss_fn(logits, y)
 
         bs = scores.size(0)
         total_loss += float(loss.item()) * bs
         n += bs
 
-        y_true_np = labels.detach().cpu().numpy().astype(np.int32)
         all_true.append(y_true_np)
 
-        if cfg.output == "sigmoid":
-            pos_prob = torch.sigmoid(logits).squeeze(-1).detach().cpu().numpy()
-            all_pos_probs.append(pos_prob)
-        else:
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-            if cfg.n_classes == 2:
-                all_pos_probs.append(probs[:, 1])
+        if is_binary_eval:
+            pos_prob = _extract_pos_prob(logits, cfg)
+            if pos_prob is not None:
+                all_pos_probs.append(pos_prob)
+
+        alpha = out.get("alpha", None) if isinstance(out, dict) else None
+        if alpha is not None:
+            alpha_stats.update(alpha)
 
     avg_loss = total_loss / max(1, n)
     y_true = np.concatenate(all_true, axis=0) if all_true else np.array([], dtype=np.int32)
 
     metrics: Dict[str, Any] = {"loss": avg_loss}
 
-    # Binary metrics if possible
-    if cfg.output == "sigmoid" or (cfg.output == "softmax" and cfg.n_classes == 2):
+    if is_binary_eval:
         y_prob = np.concatenate(all_pos_probs, axis=0) if all_pos_probs else np.array([])
-        bm = compute_binary_metrics(y_true, y_prob)
-        metrics.update(bm)
+        metrics.update(compute_binary_metrics(y_true, y_prob))
 
-    # alpha stats
-    if alphas:
-        A = np.concatenate(alphas, axis=0)  # (N, M)
-        metrics["alpha_mean"] = A.mean(axis=0).tolist()
-        metrics["alpha_std"] = A.std(axis=0).tolist()
-
-        eps = 1e-12
-        metrics["alpha_entropy"] = float((-A * np.log(A + eps)).sum(axis=1).mean())
-
+    metrics.update(alpha_stats.finalize())
     return metrics
 
 
-def select_score_from_metrics(
-    val_metrics: Dict[str, Any],
-    test_metrics: Optional[Dict[str, Any]],
-    cfg: MetaMatcherConfig
-) -> float:
-    """
-    Select best checkpoint by TEST F1 if test_metrics exist and include f1.
-    Otherwise fallback to cfg.best_metric on validation.
-    """
-    if test_metrics is not None:
-        tf1 = test_metrics.get("f1", None)
-        if tf1 is not None and not (isinstance(tf1, float) and np.isnan(tf1)):
-            return float(tf1)
-
+def select_score_from_metrics(val_metrics: Dict[str, Any], cfg: MetaMatcherConfig) -> float:
     if cfg.best_metric == "val_loss":
         return -float(val_metrics["loss"])
     if cfg.best_metric == "val_auc":
         return float(val_metrics.get("auc", float("-inf")))
     return float(val_metrics.get("f1", float("-inf")))
+
+
+def entropy_weight_for_epoch(cfg: MetaMatcherConfig, epoch: int) -> float:
+    if cfg.epochs <= 1:
+        return float(cfg.alpha_entropy_weight_final)
+    ratio = (epoch - 1) / (cfg.epochs - 1)
+    start = float(cfg.alpha_entropy_weight)
+    end = float(cfg.alpha_entropy_weight_final)
+    return start + (end - start) * ratio
+
+
+def get_git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
 
 
 def train(
@@ -114,13 +220,22 @@ def train(
     out_dir: str = "runs/meta_matcher",
 ) -> Dict[str, Any]:
     os.makedirs(out_dir, exist_ok=True)
+    set_seed(cfg.seed)
 
-    model = MetaMatcher(cfg).to(cfg.device)
-    loss_fn = make_loss(cfg)
+    runtime_device = resolve_runtime_device(cfg)
+
+    model = MetaMatcher(cfg).to(runtime_device)
+    loss_fn = make_loss(cfg, train_loader=train_loader, device=runtime_device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    # entropy regularization weight (prevents alpha collapse)
-    alpha_entropy_weight = float(getattr(cfg, "alpha_entropy_weight", 0.0))
+    scheduler = None
+    if cfg.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min" if cfg.best_metric == "val_loss" else "max",
+            factor=cfg.scheduler_factor,
+            patience=cfg.scheduler_patience,
+        )
 
     history: Dict[str, Any] = {
         "train_loss": [], "val_loss": [], "test_loss": [],
@@ -129,36 +244,40 @@ def train(
         "val_alpha_entropy": [], "test_alpha_entropy": [],
         "val_alpha_mean": [], "test_alpha_mean": [],
         "val_alpha_std": [], "test_alpha_std": [],
+        "lr": [], "entropy_weight": [],
+        "device": runtime_device,
     }
 
     best = {"score": float("-inf"), "epoch": -1, "path": None, "metrics": None}
     best_path = os.path.join(out_dir, "best_model.pt")
+    epochs_without_improvement = 0
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         running, n = 0.0, 0
+        ent_weight = entropy_weight_for_epoch(cfg, epoch)
 
         for scores, emb, labels in train_loader:
-            scores = scores.to(cfg.device)
-            emb = emb.to(cfg.device)
-            y = labels.float().to(cfg.device).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(cfg.device)
+            scores = scores.to(runtime_device, non_blocking=True)
+            emb = emb.to(runtime_device, non_blocking=True)
+            y = labels.float().to(runtime_device, non_blocking=True).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(runtime_device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
 
             out = model(scores, emb)
             logits = out["logits"]
 
-            # main loss
             loss = loss_fn(logits, y)
 
-            # NEW: entropy regularization (maximize entropy -> subtract)
-            if alpha_entropy_weight > 0.0 and isinstance(out, dict) and out.get("alpha", None) is not None:
+            if ent_weight > 0.0 and isinstance(out, dict) and out.get("alpha", None) is not None:
                 alpha = out["alpha"]
                 eps = 1e-12
                 entropy = (-alpha * torch.log(alpha + eps)).sum(dim=1).mean()
-                loss = loss - alpha_entropy_weight * entropy
+                loss = loss - ent_weight * entropy
 
             loss.backward()
+            if cfg.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
             opt.step()
 
             bs = scores.size(0)
@@ -167,10 +286,13 @@ def train(
 
         train_loss = running / max(1, n)
 
-        val_metrics = evaluate(model, val_loader, cfg)
-        test_metrics = evaluate(model, test_loader, cfg) if test_loader is not None else None
+        val_metrics = evaluate(model, val_loader, cfg, device=runtime_device, loss_fn=loss_fn)
+        test_metrics = (
+            evaluate(model, test_loader, cfg, device=runtime_device, loss_fn=loss_fn)
+            if test_loader is not None
+            else None
+        )
 
-        # history
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
         history["val_acc"].append(val_metrics.get("acc", float("nan")))
@@ -179,6 +301,8 @@ def train(
         history["val_alpha_entropy"].append(val_metrics.get("alpha_entropy", float("nan")))
         history["val_alpha_mean"].append(val_metrics.get("alpha_mean", None))
         history["val_alpha_std"].append(val_metrics.get("alpha_std", None))
+        history["lr"].append(opt.param_groups[0]["lr"])
+        history["entropy_weight"].append(ent_weight)
 
         if test_metrics is not None:
             history["test_loss"].append(test_metrics["loss"])
@@ -189,47 +313,46 @@ def train(
             history["test_alpha_mean"].append(test_metrics.get("alpha_mean", None))
             history["test_alpha_std"].append(test_metrics.get("alpha_std", None))
 
-        # BEST selection (by test_f1 if possible)
-        score = select_score_from_metrics(val_metrics, test_metrics, cfg)
+        score = select_score_from_metrics(val_metrics, cfg)
         if score > best["score"]:
             best.update({"score": score, "epoch": epoch, "path": best_path,
                          "metrics": {"val": val_metrics, "test": test_metrics}})
             save_best_checkpoint(best_path, cfg, model, epoch, best["metrics"])
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
-        # logging
-        alpha_info = ""
-        if "alpha_mean" in val_metrics:
-            alpha_info = (
-                f" | val_alpha_mean={[round(x,3) for x in val_metrics['alpha_mean']]} "
-                f"val_alpha_std={[round(x,3) for x in val_metrics.get('alpha_std', [])]} "
-                f"val_alpha_ent={val_metrics.get('alpha_entropy', float('nan')):.3f}"
-            )
-
-        test_info = ""
-        if test_metrics is not None:
-            test_info = (
-                f" | test_loss={test_metrics['loss']:.4f} "
-                f"test_f1={test_metrics.get('f1', float('nan')):.4f}"
-            )
-
-        extra = ""
-        if alpha_entropy_weight > 0:
-            extra += f" | ent_w={alpha_entropy_weight:g}"
+        if scheduler is not None:
+            if cfg.best_metric == "val_loss":
+                scheduler.step(val_metrics["loss"])
+            elif cfg.best_metric == "val_auc":
+                scheduler.step(val_metrics.get("auc", float("-inf")))
+            else:
+                scheduler.step(val_metrics.get("f1", float("-inf")))
 
         print(
-            f"[Epoch {epoch:03d}/{cfg.epochs}] "
-            f"train_loss={train_loss:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} "
-            f"val_acc={val_metrics.get('acc', float('nan')):.4f} "
-            f"val_f1={val_metrics.get('f1', float('nan')):.4f} "
-            f"val_auc={val_metrics.get('auc', float('nan')):.4f}"
-            + test_info
-            + alpha_info
-            + extra
+            f"[Epoch {epoch:03d}/{cfg.epochs}] train_loss={train_loss:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} val_f1={val_metrics.get('f1', float('nan')):.4f} "
+            f"val_auc={val_metrics.get('auc', float('nan')):.4f} "
+            f"lr={opt.param_groups[0]['lr']:.3e} ent_w={ent_weight:.4f} device={runtime_device}"
         )
+
+        if cfg.early_stopping_patience > 0 and epochs_without_improvement >= cfg.early_stopping_patience:
+            print(f"Early stopping at epoch {epoch} (patience={cfg.early_stopping_patience})")
+            break
+
+    run_meta = {
+        "seed": cfg.seed,
+        "git_commit": get_git_commit(),
+        "config": cfg.__dict__,
+        "best_epoch": best["epoch"],
+        "runtime_device": runtime_device,
+    }
 
     with open(os.path.join(out_dir, "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+    with open(os.path.join(out_dir, "run_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(run_meta, f, indent=2)
 
     plot_history(history, out_dir)
-    return {"best": best, "history": history, "out_dir": out_dir}
+    return {"best": best, "history": history, "out_dir": out_dir, "run_meta": run_meta}
