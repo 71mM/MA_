@@ -2,7 +2,7 @@ import os
 import json
 import random
 import subprocess
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 import torch
@@ -112,16 +112,16 @@ def evaluate(
         total_loss += float(loss.item()) * bs
         n += bs
 
-        y_true_np = labels.detach().cpu().numpy().astype(np.int32)
         all_true.append(y_true_np)
 
-        if cfg.output == "sigmoid":
-            pos_prob = torch.sigmoid(logits).squeeze(-1).detach().cpu().numpy()
-            all_pos_probs.append(pos_prob)
-        else:
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-            if cfg.n_classes == 2:
-                all_pos_probs.append(probs[:, 1])
+        if is_binary_eval:
+            pos_prob = _extract_pos_prob(logits, cfg)
+            if pos_prob is not None:
+                all_pos_probs.append(pos_prob)
+
+        alpha = out.get("alpha", None) if isinstance(out, dict) else None
+        if alpha is not None:
+            alpha_stats.update(alpha)
 
     avg_loss = total_loss / max(1, n)
     y_true = np.concatenate(all_true, axis=0) if all_true else np.array([], dtype=np.int32)
@@ -141,6 +141,7 @@ def evaluate(
         eps = 1e-12
         metrics["alpha_entropy"] = float((-a * np.log(a + eps)).sum(axis=1).mean())
 
+    metrics.update(alpha_stats.finalize())
     return metrics
 
 
