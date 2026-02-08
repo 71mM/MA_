@@ -136,10 +136,17 @@ def main():
         use_attention=True,
         output="softmax",
         epochs=15,
-        best_metric="test_f1",
+        best_metric="val_f1",
+        activation="gelu",
+        calibration_mode="diagonal",
+        rnn_pooling="hidden",
+        scheduler="plateau",
+        early_stopping_patience=4,
+        use_pos_weight=True,
+        seed=42,
     )
 
-    train_loader = DataLoader(ds_tr, batch_size=1, shuffle=True)
+    train_loader = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True)
     val_loader   = DataLoader(ds_va, batch_size=cfg.batch_size, shuffle=False)
     test_loader  = DataLoader(ds_te, batch_size=cfg.batch_size, shuffle=False)
 
