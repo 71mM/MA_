@@ -37,7 +37,7 @@ def infer_pos_weight(train_loader: DataLoader, device: str) -> Optional[torch.Te
     pos = 0
     neg = 0
     for _, _, labels in train_loader:
-        labels_np = labels.cpu().numpy().astype(np.int32)
+        labels_np = labels.detach().cpu().numpy().astype(np.int32)
         pos += int((labels_np == 1).sum())
         neg += int((labels_np == 0).sum())
     if pos == 0:
@@ -74,65 +74,7 @@ def make_loss(cfg: MetaMatcherConfig, train_loader: Optional[DataLoader] = None,
     return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 
-def _prepare_targets(labels: torch.Tensor, cfg: MetaMatcherConfig, device: str) -> Tuple[torch.Tensor, np.ndarray]:
-    labels_cpu = labels.cpu().numpy().astype(np.int32)
-    if cfg.output == "sigmoid":
-        y = labels.float().to(device, non_blocking=True).view(-1, 1)
-    else:
-        y = labels.long().to(device, non_blocking=True)
-    return y, labels_cpu
-
-
-def _extract_pos_prob(logits: torch.Tensor, cfg: MetaMatcherConfig) -> Optional[np.ndarray]:
-    if cfg.output == "sigmoid":
-        return torch.sigmoid(logits).squeeze(-1).detach().cpu().numpy()
-
-    if cfg.output == "softmax" and cfg.n_classes == 2:
-        probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
-        return probs[:, 1]
-
-    return None
-
-
-class AlphaStats:
-    def __init__(self):
-        self.count = 0
-        self.sum_vec = None
-        self.sum_sq_vec = None
-        self.entropy_sum = 0.0
-
-    def update(self, alpha: torch.Tensor) -> None:
-        a = alpha.detach().cpu().numpy()
-        if a.size == 0:
-            return
-
-        if self.sum_vec is None:
-            self.sum_vec = np.zeros(a.shape[1], dtype=np.float64)
-            self.sum_sq_vec = np.zeros(a.shape[1], dtype=np.float64)
-
-        self.sum_vec += a.sum(axis=0)
-        self.sum_sq_vec += (a ** 2).sum(axis=0)
-        self.count += a.shape[0]
-
-        eps = 1e-12
-        self.entropy_sum += float((-a * np.log(a + eps)).sum(axis=1).sum())
-
-    def finalize(self) -> Dict[str, Any]:
-        if self.count == 0 or self.sum_vec is None or self.sum_sq_vec is None:
-            return {}
-
-        mean = self.sum_vec / self.count
-        var = np.maximum(self.sum_sq_vec / self.count - mean ** 2, 0.0)
-        std = np.sqrt(var)
-
-        return {
-            "alpha_mean": mean.tolist(),
-            "alpha_std": std.tolist(),
-            "alpha_entropy": self.entropy_sum / self.count,
-        }
-
-
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
@@ -142,21 +84,27 @@ def evaluate(
 ) -> Dict[str, Any]:
     model.eval()
     local_loss_fn = loss_fn if loss_fn is not None else make_loss(cfg, device=device)
-    is_binary_eval = cfg.output == "sigmoid" or (cfg.output == "softmax" and cfg.n_classes == 2)
 
     all_pos_probs = []
     all_true = []
     total_loss = 0.0
     n = 0
-    alpha_stats = AlphaStats()
+    alphas = []
 
     for scores, emb, labels in loader:
-        scores = scores.to(device, non_blocking=True)
-        emb = emb.to(device, non_blocking=True)
-        y, y_true_np = _prepare_targets(labels, cfg, device)
+        scores = scores.to(device)
+        emb = emb.to(device)
+
+        if cfg.output == "sigmoid":
+            y = labels.float().to(device).view(-1, 1)
+        else:
+            y = labels.long().to(device)
 
         out = model(scores, emb)
         logits = out["logits"]
+
+        if isinstance(out, dict) and out.get("alpha", None) is not None:
+            alphas.append(out["alpha"].detach().cpu().numpy())
 
         loss = local_loss_fn(logits, y)
 
@@ -180,9 +128,18 @@ def evaluate(
 
     metrics: Dict[str, Any] = {"loss": avg_loss}
 
-    if is_binary_eval:
+    if cfg.output == "sigmoid" or (cfg.output == "softmax" and cfg.n_classes == 2):
         y_prob = np.concatenate(all_pos_probs, axis=0) if all_pos_probs else np.array([])
-        metrics.update(compute_binary_metrics(y_true, y_prob))
+        bm = compute_binary_metrics(y_true, y_prob)
+        metrics.update(bm)
+
+    if alphas:
+        a = np.concatenate(alphas, axis=0)
+        metrics["alpha_mean"] = a.mean(axis=0).tolist()
+        metrics["alpha_std"] = a.std(axis=0).tolist()
+
+        eps = 1e-12
+        metrics["alpha_entropy"] = float((-a * np.log(a + eps)).sum(axis=1).mean())
 
     metrics.update(alpha_stats.finalize())
     return metrics
@@ -258,9 +215,9 @@ def train(
         ent_weight = entropy_weight_for_epoch(cfg, epoch)
 
         for scores, emb, labels in train_loader:
-            scores = scores.to(runtime_device, non_blocking=True)
-            emb = emb.to(runtime_device, non_blocking=True)
-            y = labels.float().to(runtime_device, non_blocking=True).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(runtime_device, non_blocking=True)
+            scores = scores.to(runtime_device)
+            emb = emb.to(runtime_device)
+            y = labels.float().to(runtime_device).view(-1, 1) if cfg.output == "sigmoid" else labels.long().to(runtime_device)
 
             opt.zero_grad(set_to_none=True)
 
