@@ -52,7 +52,7 @@ def resolve_activation(name: str):
 class MetaMatcher(nn.Module):
     """
     scores: (B, M+K)
-      - first M = base model outputs (Mudgal models)
+      - first M = base model outputs
       - last  K = extra features (aggregates etc.)
 
     base_score_input:
@@ -170,10 +170,6 @@ class MetaMatcher(nn.Module):
 
         self.head = nn.Linear(backbone_out, 1 if cfg.output == "sigmoid" else cfg.n_classes)
 
-    # ---------- helpers ----------
-    def _prob_to_logit(self, p: torch.Tensor) -> torch.Tensor:
-        p = p.clamp(self.score_logit_eps, 1.0 - self.score_logit_eps)
-        return torch.log(p / (1.0 - p))
 
     def _split_scores(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         base = scores[:, :self.M]

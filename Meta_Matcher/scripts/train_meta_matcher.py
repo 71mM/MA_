@@ -102,10 +102,10 @@ def main():
     dataset_name = "ab"
 
     # >>> IMPORTANT: meta-train-pool is VALIDATION (to avoid in-sample base leakage)
-    meta_scores_path = "../../data/abt-buy_textual/big_scores_validation_ab.csv"
+    meta_scores_path = "../../old/big_scores_validation_ab.csv"
     meta_raw_path    = "../../data/abt-buy_textual/validation_full.csv"
 
-    test_scores_path = "../../data/abt-buy_textual/big_scores_test_ab.csv"
+    test_scores_path = "../../old/big_scores_test_ab.csv"
     test_raw_path    = "../../data/abt-buy_textual/test_full.csv"
 
     embedder_type = "minilm"  # "minilm" | "glove" | "fasttext"

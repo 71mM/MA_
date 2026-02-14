@@ -13,10 +13,11 @@ import matplotlib.pyplot as plt
 # Konfiguration
 # -----------------------------
 CSV_PATHS = [
-    "../Evaluation/dataframes/big_scores_test_ab.csv",
-    "../Evaluation/dataframes/big_scores_test_ag.csv",
-    "../Evaluation/dataframes/big_scores_test_ia.csv",
-    "../Evaluation/dataframes/big_scores_train_wm.csv",
+    "../Evaluation/dataframes/big_scores_ab__test_full.csv",
+    "../Evaluation/dataframes/big_scores_ag__test_full.csv",
+    "../Evaluation/dataframes/big_scores_ia__test_full.csv",
+    "../Evaluation/dataframes/big_scores_wm__test_full.csv",
+    "../Evaluation/dataframes/big_scores_dplb__test_full.csv"
 ]
 
 # Output-Verhalten:
