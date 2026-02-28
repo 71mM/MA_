@@ -52,7 +52,7 @@ from Meta_Matcher.io.scoring_loader import load_scores, DEFAULT_SCORE_COLS
 DATASET_NAME = "Walmart-Amazon_dirty"
 
 # --- trained model checkpoint (.pt) ---
-MODEL_CKPT_PATH = "best_models_from_hpo/wm/trial_0039/best_model.pt"
+MODEL_CKPT_PATH = "best_models_from_hpo/wm/trial_0036/best_model.pt"
 
 # --- test data ---
 TEST_SCORES_PATH = r"../../data/Walmart-Amazon_dirty/big_scores_wm__test_full.csv"

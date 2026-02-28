@@ -42,10 +42,6 @@ class ScoreCalibrator(nn.Module):
 def resolve_activation(name: str):
     if name == "relu":
         return nn.ReLU
-    if name == "gelu":
-        return nn.GELU
-    if name == "silu":
-        return nn.SiLU
     raise ValueError(f"Unsupported activation: {name}")
 
 
@@ -57,7 +53,6 @@ class MetaMatcher(nn.Module):
 
     base_score_input:
       - "prob": base scores in [0,1], calibration happens in logit-space (recommended)
-      - "logit": base scores are logits, calibration is affine in logit-space (no prob->logit conversion needed)
     """
     def __init__(self, cfg: MetaMatcherConfig):
         super().__init__()
@@ -75,7 +70,7 @@ class MetaMatcher(nn.Module):
         if getattr(cfg, "n_extra_features", None) is None:
             cfg.n_extra_features = int(cfg.n_models - self.M)
 
-        # Optional: strict consistency check
+
         if getattr(cfg, "debug_checks", False):
             if self.M > int(cfg.n_models):
                 raise ValueError(f"n_base_models (M={self.M}) cannot be > n_models ({cfg.n_models})")
@@ -194,10 +189,10 @@ class MetaMatcher(nn.Module):
     def _build_tokens(self, scores_cal: torch.Tensor, pair_emb: torch.Tensor, score_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         bsz, n_models = scores_cal.shape
         model_idx = torch.arange(n_models, device=scores_cal.device).unsqueeze(0).expand(bsz, -1)
-        model_feat = self.model_id_emb(model_idx)  # (B,M,model_id_dim)
+        model_feat = self.model_id_emb(model_idx)
 
-        score_feat = scores_cal.unsqueeze(-1)  # (B,M,1)
-        emb_feat = pair_emb.unsqueeze(1).expand(bsz, n_models, pair_emb.size(-1))  # (B,M,E)
+        score_feat = scores_cal.unsqueeze(-1)
+        emb_feat = pair_emb.unsqueeze(1).expand(bsz, n_models, pair_emb.size(-1))
 
         feats = [score_feat]
         if getattr(self.cfg, "use_score_mask", False):

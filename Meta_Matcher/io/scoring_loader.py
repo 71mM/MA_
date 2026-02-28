@@ -12,6 +12,5 @@ def load_scores(scores_path: str, id_col: str = "id", label_col: str = "label",
     if missing:
         raise ValueError(f"Scores-Datei fehlt Spalten: {missing}")
 
-    # label optional (z.B. bei test ohne label)
     keep = [id_col] + score_cols + ([label_col] if label_col in df.columns else [])
     return df[keep].copy()

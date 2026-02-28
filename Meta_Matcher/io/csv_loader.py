@@ -13,7 +13,6 @@ def load_scores_and_labels(
 
 def infer_score_cols(df: pd.DataFrame, exclude: Optional[set] = None) -> List[str]:
     exclude = exclude or set()
-    # Heuristik: numeric columns minus known fields
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     candidates = [c for c in numeric_cols if c not in exclude]
     return candidates

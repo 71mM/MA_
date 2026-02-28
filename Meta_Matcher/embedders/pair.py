@@ -7,9 +7,7 @@ import numpy as np
 import pandas as pd
 
 
-# ------------------------------------------------------------
-# Auto adapter (built-in here to keep it self-contained)
-# ------------------------------------------------------------
+
 @dataclass
 class AutoTextConfig:
     id_col: str = "id"

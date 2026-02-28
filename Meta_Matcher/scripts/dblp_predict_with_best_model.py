@@ -226,6 +226,7 @@ def predict(model: MetaMatcher, cfg: MetaMatcherConfig, loader: DataLoader) -> D
 
     probs = np.concatenate(probs_all, axis=0) if probs_all else np.array([], dtype=np.float32)
     alpha = np.concatenate(alpha_all, axis=0) if alpha_all else None
+    print(alpha)
     return {"probs": probs, "alpha": alpha}
 
 

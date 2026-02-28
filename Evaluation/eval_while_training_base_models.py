@@ -126,7 +126,6 @@ def plot_metrics_subplots(epochs, train_metrics, test_metrics, out_path, title):
     plt.close()
 
 
-# Optional: wenn du weiterhin eine einzelne BCE-Plot-Funktion willst (fixe Benennung)
 def plot_learningcurve_bce(epochs, train_bce, test_bce, out_path, title):
     plt.figure()
     plt.plot(epochs, train_bce, label="Train BCE")

@@ -25,9 +25,7 @@ from sklearn.metrics import (
     average_precision_score,
 )
 
-# ============================================================
-# 🔥 HIER DEINE PFADE EINTRAGEN
-# ============================================================
+
 
 BASE_PATH = Path(
     "../Meta_Matcher/scripts/Meta_Matcher/scripts/predictions/"
@@ -155,7 +153,7 @@ def evaluate():
         metrics["file"] = file
         metrics["n"] = len(df)
 
-        # Score-basierte Metriken
+
         if "match_prob" in df.columns:
             y_score = df["match_prob"]
             all_score.append(y_score)
@@ -183,33 +181,6 @@ def evaluate():
         all_true.append(y_true)
         all_pred.append(y_pred)
 
-    # =====================================================
-    # TOTAL (über alle 5 Dateien)
-    # =====================================================
-
-    y_true_all = pd.concat(all_true)
-    y_pred_all = pd.concat(all_pred)
-
-    total_metrics = compute_metrics(y_true_all, y_pred_all)
-    total_metrics["file"] = "TOTAL"
-    total_metrics["n"] = len(y_true_all)
-
-    if all_score:
-        y_score_all = pd.concat(all_score)
-
-        if MAKE_PLOTS:
-            total_metrics["roc_auc"] = plot_roc(
-                y_true_all, y_score_all,
-                "ROC - TOTAL",
-                OUTPUT_DIR / "roc_TOTAL.png"
-            )
-            total_metrics["avg_precision"] = plot_pr(
-                y_true_all, y_score_all,
-                "PR - TOTAL",
-                OUTPUT_DIR / "pr_TOTAL.png"
-            )
-
-    results.append(total_metrics)
 
     results_df = pd.DataFrame(results)
     results_df.to_csv(OUTPUT_DIR / "metrics_report.csv", index=False)

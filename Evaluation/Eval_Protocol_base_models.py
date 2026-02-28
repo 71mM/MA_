@@ -21,7 +21,7 @@ DATA_DIRS = {
     "ag": Path(r"../data/Amazon-Google_structured/"),
     "ia": Path(r"../data/Itunes-Amazon/"),
     "wm": Path(r"../data/Walmart-Amazon_dirty/"),
-    "dblp": Path(r"../data/dblp_scholar_exp_data"),  # FIX: r"r../..." -> "../..."
+    "dblp": Path(r"../data/dblp_scholar_exp_data"),
 }
 
 MODEL_TYPES = ["sif", "rnn", "attention", "hybrid"]
@@ -29,7 +29,7 @@ DATASETS = ["ab", "ag", "ia", "wm", "dblp"]
 
 THRESHOLD = 0.5  # Match-Score Schwelle für Klassifikation
 
-# Big-Scores sollen auch für diese Splits erzeugt werden:
+
 BIG_SCORE_SPLITS = {
     "test_full": "test_full.csv",
     "train_full": "train_full.csv",

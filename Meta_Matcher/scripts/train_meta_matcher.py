@@ -65,7 +65,7 @@ def merge_scores_and_raw(
     df_scores = load_scores(scores_path, id_col="id", label_col="label", score_cols=DEFAULT_SCORE_COLS)
     score_cols = list(DEFAULT_SCORE_COLS)
 
-    # (A) convert probs -> logits (optional)
+
     if use_logits:
         logits = prob_to_logit(df_scores[score_cols].to_numpy(np.float32))
         df_scores.loc[:, score_cols] = logits
@@ -101,7 +101,7 @@ def main():
     # ============================================================
     dataset_name = "ab"
 
-    # >>> IMPORTANT: meta-train-pool is VALIDATION (to avoid in-sample base leakage)
+
     meta_scores_path = "../../old/big_scores_validation_ab.csv"
     meta_raw_path    = "../../data/abt-buy_textual/validation_full.csv"
 
@@ -116,7 +116,7 @@ def main():
     USE_LOGITS = True
     ADD_LOGIT_AGGREGATES = True
 
-    # >>> MINI-VAL SPLIT INSIDE META-POOL
+
     MINI_VAL_FRAC = 0.2
     SEED = 42
 
@@ -213,10 +213,10 @@ def main():
     n_extra = len(score_cols) - n_base        # 5 aggregates if enabled
 
     cfg = MetaMatcherConfig(
-        n_models=len(score_cols),          # total feature cols passed into PairScoreDataset
-        n_base_models=n_base,              # NEW (for MetaMatcher base/extra split)
-        n_extra_features=n_extra,          # NEW
-        base_score_input="logit" if USE_LOGITS else "prob",  # NEW
+        n_models=len(score_cols),
+        n_base_models=n_base,
+        n_extra_features=n_extra,
+        base_score_input="logit" if USE_LOGITS else "prob",
 
         emb_dim=int(emb_tr.shape[1]),
         arch="lstm",

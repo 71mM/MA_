@@ -20,9 +20,7 @@ CSV_PATHS = [
     "../Evaluation/dataframes/big_scores_dplb__test_full.csv"
 ]
 
-# Output-Verhalten:
-# - True: erzeugt neue Dateien <stem>_with_ensembles.csv
-# - False: überschreibt die Eingabedatei (in-place)
+
 WRITE_NEW_FILES = True
 
 # Ensemble-Spaltennamen
@@ -178,17 +176,17 @@ def main() -> None:
 
         label_col = find_label_col(df)
 
-        # Modelle als numeric lesen
+
         m = df[model_cols].apply(pd.to_numeric, errors="coerce")
 
-        # Ensemble 1: Majority Vote (erst pro Modell binarize, dann >=2 -> 1)
+
         bin_m = (m >= THRESH).astype(int)
         maj = (bin_m.sum(axis=1) >= 2).astype(int)  # tie 2:2 -> 1
 
-        # Ensemble 2: Average-Threshold
+
         avg = (m.mean(axis=1) >= THRESH).astype(int)
 
-        # Ensemble-Spalten schreiben/überschreiben
+
         df[MAJ_COL] = maj
         df[AVG_COL] = avg
 
@@ -197,7 +195,7 @@ def main() -> None:
         df.to_csv(out_csv, index=False)
         updated_paths.append(out_csv)
 
-        # Metrics berechnen (falls Label existiert)
+
         metrics_rows = []
         if label_col is not None:
             y_true = pd.to_numeric(df[label_col], errors="coerce").fillna(0).astype(int).to_numpy()
@@ -215,7 +213,7 @@ def main() -> None:
         metrics_df.to_csv(metrics_csv, index=False)
         per_file_metrics_paths.append(metrics_csv)
 
-    # Summary
+
     summary_df = pd.DataFrame(summary_rows)
     summary_csv = "ensemble_metrics_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
